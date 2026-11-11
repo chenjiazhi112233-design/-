@@ -1,0 +1,100 @@
+name: iOS Release (unsigned IPA)
+run-name: iOS unsigned Release · ${{ github.sha }}
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      # Keep this equal to the locally validated SDK; stable is intentionally pinned.
+      FLUTTER_VERSION: '3.47.9'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+      - name: Resolve pinned dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Analyze
+        run: flutter analyze
+      - name: Test
+        run: flutter test
+      - name: Build iPhone Release without signing
+        run: flutter build ios --release --no-codesign --build-number "$GITHUB_RUN_NUMBER"
+      - name: Validate executable and package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=build/ios/iphoneos/Runner.app
+          test -d "$app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")
+          test -f "$app/$executable"
+          file "$app/$executable" | grep -q 'Mach-O'
+          lipo -archs "$app/$executable" | grep -qw arm64
+          test -f "$app/Frameworks/App.framework/App"
+          mkdir -p build/ipa/Payload
+          cp -R "$app" build/ipa/Payload/
+          (
+            cd build/ipa
+            /usr/bin/zip -qry ZhongyiLianda-unsigned.ipa Payload
+            shasum -a 256 ZhongyiLianda-unsigned.ipa > SHA256SUMS.txt
+            unzip -t ZhongyiLianda-unsigned.ipa
+          )
+          {
+            echo '## iOS Release build'
+            echo "Commit: $GITHUB_SHA"
+            echo 'Artifact: ZhongyiLianda-unsigned.ipa'
+            echo 'This is an unsigned arm64 iPhone Release build. Signing is required for installation on a standard iPhone.'
+            echo '```'
+            cat build/ipa/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ZhongyiLianda-iOS-unsigned-${{ github.run_number }}
+          path: |
+            build/ipa/ZhongyiLianda-unsigned.ipa
+            build/ipa/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish downloadable IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build/ipa/RELEASE_NOTES.md <<'NOTES'
+          中亿联达智能打托 v1.0：离线码垛计算、布局预览与本机方案保存。
+
+          此 IPA 在 macOS 上使用 Flutter Release 编译，包含 arm64 程序，未经 Apple 签名。普通 iPhone 安装运行需要有效签名。
+          NOTES
+          gh release create "unsigned-${GITHUB_RUN_NUMBER}" \
+            build/ipa/ZhongyiLianda-unsigned.ipa \
+            build/ipa/SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "中亿联达智能打托 · iOS Release ${GITHUB_RUN_NUMBER}（未签名）" \
+            --notes-file build/ipa/RELEASE_NOTES.md \
+            --prerelease
